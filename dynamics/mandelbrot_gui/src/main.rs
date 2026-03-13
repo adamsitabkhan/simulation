@@ -103,14 +103,35 @@ fn compute_tile(key: TileKey) -> TileData {
     let mut pixels = Vec::with_capacity(TILE_SIZE * TILE_SIZE * 4);
 
     for py in 0..TILE_SIZE {
-        let ci = y_max - (py as f64 * dy);
         for px in 0..TILE_SIZE {
-            let cr = x_min + (px as f64 * dx);
-            let color = match mandelbrot(cr, ci) {
-                Some(val) => palette_color(val * 0.15),
-                None => [0, 0, 0, 255],
-            };
-            pixels.extend_from_slice(&color);
+            let mut r_sum = 0.0;
+            let mut g_sum = 0.0;
+            let mut b_sum = 0.0;
+
+            // 2x2 Supersampling
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let sub_x = px as f64 + (sx as f64 + 0.5) / 2.0;
+                    let sub_y = py as f64 + (sy as f64 + 0.5) / 2.0;
+                    
+                    let cr = x_min + (sub_x * dx);
+                    let ci = y_max - (sub_y * dy);
+                    
+                    let color = match mandelbrot(cr, ci) {
+                        Some(val) => palette_color(val * 0.15),
+                        None => [0, 0, 0, 255],
+                    };
+                    
+                    r_sum += color[0] as f64;
+                    g_sum += color[1] as f64;
+                    b_sum += color[2] as f64;
+                }
+            }
+            
+            pixels.push((r_sum / 4.0) as u8);
+            pixels.push((g_sum / 4.0) as u8);
+            pixels.push((b_sum / 4.0) as u8);
+            pixels.push(255);
         }
     }
 
@@ -128,6 +149,11 @@ struct MandelbrotApp {
     tx_req: Sender<TileKey>,
     rx_res: Receiver<TileData>,
     
+    // Screenshot telemetry
+    rx_progress: Receiver<f32>,
+    capture_progress: Option<f32>,
+    capture_finished_time: Option<f64>,
+
     center_x: f64,
     center_y: f64,
     level: i32,     // Base index, discrete powers of 2 (0 is minimum)
@@ -151,16 +177,96 @@ impl Default for MandelbrotApp {
             });
         }
 
+        let (tx_progress, rx_progress) = unbounded();
+
         Self {
             cache: HashMap::new(),
             pending: HashSet::new(),
             tx_req,
             rx_res,
+            rx_progress,
+            capture_progress: None,
+            capture_finished_time: None,
             center_x: -0.5,
             center_y: 0.0,
-            level: 0,
+            level: 1,
             fractional_zoom: 1.0,
         }
+    }
+}
+
+fn format_scientific(val: f64) -> String {
+    if val >= 0.001 && val < 1_000_000.0 {
+        // Standard formatting for intermediate numbers
+        if val == val.floor() {
+            return format!("{:.0}", val);
+        } else {
+            return format!("{:.2}", val);
+        }
+    }
+
+    // Mathematical zero protection
+    if val == 0.0 {
+        return "0".to_string();
+    }
+
+    let exponent = val.abs().log10().floor() as i32;
+    let mantissa = val / 10.0_f64.powi(exponent);
+
+    let superscript_digits = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    
+    let mut exp_str = String::new();
+    if exponent < 0 {
+        exp_str.push('⁻');
+    }
+    
+    for c in exponent.abs().to_string().chars() {
+        if let Some(digit) = c.to_digit(10) {
+            exp_str.push(superscript_digits[digit as usize]);
+        }
+    }
+
+    format!("{:.2} × 10{}", mantissa, exp_str)
+}
+
+impl MandelbrotApp {
+    fn get_fallback_tile(&self, key: TileKey) -> Option<(egui::TextureId, egui::Rect)> {
+        let mut parent_key = key;
+        for diff in 1..=8 {
+            parent_key.level -= 1;
+            parent_key.x = (parent_key.x as f64 / 2.0).floor() as i64;
+            parent_key.y = (parent_key.y as f64 / 2.0).ceil() as i64;
+
+            if let Some(parent) = self.cache.get(&parent_key) {
+                // Find where the child is inside the parent
+                // The parent covers twice the area per level difference.
+                // Child width in parent UV space is 1.0 / 2^diff
+                let uv_width = 1.0 / (1 << diff) as f32;
+
+                // How many units is the child away from the parent's top-left corner?
+                // Notice that y increases upwards, so the parent top-left is actually (parent.x, parent.y)
+                let child_rel_x = key.x - (parent_key.x << diff);
+                
+                // In math coords y is up, but in UV y is down.
+                // UV(0,0) corresponds to parent max Y
+                // parent_key.y represents the top edge of the parent tile.
+                let child_rel_y = (parent_key.y << diff) - key.y;
+
+                let u_min = child_rel_x as f32 * uv_width;
+                let v_min = child_rel_y as f32 * uv_width;
+                
+                let uv_rect = egui::Rect::from_min_max(
+                    egui::pos2(u_min, v_min),
+                    egui::pos2(u_min + uv_width, v_min + uv_width),
+                );
+
+                return Some((parent.texture.id(), uv_rect));
+            }
+            if parent_key.level <= 0 {
+                break;
+            }
+        }
+        None
     }
 }
 
@@ -186,8 +292,29 @@ impl eframe::App for MandelbrotApp {
             ctx.request_repaint(); // Important to notify the UI we have new data
         }
 
-        // Animate fades
-        ctx.request_repaint(); // continuously repaint to animate the fades
+        // Drain progress updates from background thread
+        let mut progress_updated = false;
+        while let Ok(progress) = self.rx_progress.try_recv() {
+            if progress >= 1.0 {
+                self.capture_progress = None;
+                self.capture_finished_time = Some(current_time);
+            } else {
+                self.capture_progress = Some(progress);
+            }
+            progress_updated = true;
+        }
+        
+        // Ensure UI repaints continuously if rendering is active or finishing animation
+        if progress_updated || self.capture_progress.is_some() {
+            ctx.request_repaint();
+        }
+        if let Some(finish_time) = self.capture_finished_time {
+            if current_time - finish_time < 1.0 {
+                ctx.request_repaint(); // Keep animating fade-out
+            } else {
+                self.capture_finished_time = None;
+            }
+        }
 
         egui::CentralPanel::default().frame(egui::Frame::none()).show(ctx, |ui| {
             let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -216,6 +343,9 @@ impl eframe::App for MandelbrotApp {
                     let dx = pointer_pos.x - rect.center().x; // Logical UI points offset
                     let dy = pointer_pos.y - rect.center().y;
                     
+                    let original_level = self.level;
+                    let original_fractional_zoom = self.fractional_zoom;
+
                     let scale_old = 2.0_f64.powi(-self.level) / self.fractional_zoom;
                     let logical_screen_tile_size = TILE_SIZE as f64 / ppp as f64;
                     let pixels_to_coords_old = (2.0 * scale_old) / logical_screen_tile_size;
@@ -239,16 +369,17 @@ impl eframe::App for MandelbrotApp {
                     
                     // 3. Clamp minimum zoom to level 0 (initial view)
                     if self.level < 0 {
-                        self.level = 0;
-                        self.fractional_zoom = 1.0;
+                        self.level = original_level;
+                        self.fractional_zoom = original_fractional_zoom;
+                    } else {
+                        // 4. Adjust center_x/center_y so that the mouse_math_x/y remains exactly under the screen's dx/dy cursor position
+                        let scale_new = 2.0_f64.powi(-self.level) / self.fractional_zoom;
+                        let pixels_to_coords_new = (2.0 * scale_new) / logical_screen_tile_size;
+                        
+                        self.center_x = mouse_math_x - (dx as f64) * pixels_to_coords_new;
+                        self.center_y = mouse_math_y + (dy as f64) * pixels_to_coords_new;
                     }
 
-                    // 4. Adjust center_x/center_y so that the mouse_math_x/y remains exactly under the screen's dx/dy cursor position
-                    let scale_new = 2.0_f64.powi(-self.level) / self.fractional_zoom;
-                    let pixels_to_coords_new = (2.0 * scale_new) / logical_screen_tile_size;
-                    
-                    self.center_x = mouse_math_x - (dx as f64) * pixels_to_coords_new;
-                    self.center_y = mouse_math_y + (dy as f64) * pixels_to_coords_new;
                 }
             }
 
@@ -287,32 +418,34 @@ impl eframe::App for MandelbrotApp {
                 for ty in t_y_min..=t_y_max {
                     let key = TileKey { x: tx, y: ty, level: self.level };
                     
+                    // Calculate screen rectangle for this tile
+                    let math_x = tx as f64 * tile_w_coord;
+                    let math_y = ty as f64 * tile_w_coord;
+
+                    let screen_x_center = rect.center().x + ((math_x - self.center_x) / pixels_to_coords) as f32;
+                    let screen_y_center = rect.center().y - ((math_y - self.center_y) / pixels_to_coords) as f32; // Y goes down
+
+                    let width = render_tile_size;
+                    let dest_rect = egui::Rect::from_min_max(
+                        egui::pos2(screen_x_center, screen_y_center),
+                        egui::pos2(screen_x_center + width, screen_y_center + width),
+                    );
+
+                    let mut drawn_full_opacity = false;
+
                     // Draw if available, otherwise draw lower-res fallback
                     if let Some(render_tile) = self.cache.get(&key) {
-                        // Calculate screen rectangle for this tile
-                        let math_x = tx as f64 * tile_w_coord;
-                        let math_y = ty as f64 * tile_w_coord;
-
-                        let screen_x_center = rect.center().x + ((math_x - self.center_x) / pixels_to_coords) as f32;
-                        let screen_y_center = rect.center().y - ((math_y - self.center_y) / pixels_to_coords) as f32; // Y goes down
-
-                        let width = render_tile_size;
-                        let dest_rect = egui::Rect::from_min_max(
-                            egui::pos2(screen_x_center, screen_y_center),
-                            egui::pos2(screen_x_center + width, screen_y_center + width),
-                        );
-                        
-                        // Calculate fade-in opacity
-                        let age = (current_time - render_tile.insertion_time) as f32;
-                        let alpha = (age * 3.0).clamp(0.0, 1.0); // 333ms fade-in
-                        let tint = egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8);
-                        
-                        painter.image(render_tile.texture.id(), dest_rect, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), tint);
+                        painter.image(render_tile.texture.id(), dest_rect, egui::Rect::from_min_max(egui::pos2(0.0,0.0), egui::pos2(1.0,1.0)), egui::Color32::WHITE);
                     } else {
                         // Request generation since we don't have it
                         if !self.pending.contains(&key) {
                             self.pending.insert(key);
                             let _ = self.tx_req.send(key);
+                        }
+                        
+                        // Draw fallback if available natively (no crossfade)
+                        if let Some((tex_id, uv_rect)) = self.get_fallback_tile(key) {
+                            painter.image(tex_id, dest_rect, uv_rect, egui::Color32::WHITE);
                         }
                     }
                 }
@@ -323,8 +456,10 @@ impl eframe::App for MandelbrotApp {
             let cache_mb = total_bytes as f64 / 1_048_576.0;
             
             // Calculate absolute magnification scale 
-            // Default level = 0, fractional_zoom = 1.0 (scale factor = 1.0)
-            let mag = 2.0_f64.powi(self.level) * self.fractional_zoom;
+            // Default level = 1, fractional_zoom = 1.0 (scale factor = 2.0 based on level 0)
+            let mag_linear = 2.0_f64.powi(self.level) * self.fractional_zoom;
+            // Area magnification is roughly the square of the linear scaling
+            let mag_area = mag_linear.powi(2) / 4.0; // Normalized so level 1 is 1x Area
 
             painter.rect_filled(
                 egui::Rect::from_min_max(rect.min + egui::vec2(5.0, 5.0), rect.min + egui::vec2(320.0, 95.0)),
@@ -342,7 +477,7 @@ impl eframe::App for MandelbrotApp {
             painter.text(
                 rect.min + egui::vec2(15.0, 35.0),
                 egui::Align2::LEFT_TOP,
-                format!("Zoom Rank: {:.2e}x (Lvl {})", mag, self.level),
+                format!("Zoom: {}", format_scientific(mag_area)),
                 egui::FontId::monospace(14.0),
                 egui::Color32::WHITE,
             );
@@ -360,6 +495,193 @@ impl eframe::App for MandelbrotApp {
                 egui::FontId::monospace(14.0),
                 egui::Color32::from_rgb(200, 200, 200),
             );
+
+            // Draw Scale Bar (100 physical pixels wide equivalent) bottom right
+            let scale_bar_width_px = 100.0;
+            let screen_pixels_to_coords = pixels_to_coords; 
+            let math_width = (scale_bar_width_px as f64) * screen_pixels_to_coords;
+
+            let bar_y = rect.max.y - 30.0;
+            let bar_x_end = rect.max.x - 20.0;
+            let bar_x_start = bar_x_end - scale_bar_width_px;
+
+            // Draw horizontal bar
+            painter.line_segment(
+                [egui::pos2(bar_x_start, bar_y), egui::pos2(bar_x_end, bar_y)],
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+            );
+            
+            // Draw end ticks
+            painter.line_segment(
+                [egui::pos2(bar_x_start, bar_y - 4.0), egui::pos2(bar_x_start, bar_y + 4.0)],
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+            );
+            painter.line_segment(
+                [egui::pos2(bar_x_end, bar_y - 4.0), egui::pos2(bar_x_end, bar_y + 4.0)],
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+            );
+            
+            // Draw scale text right above it
+            painter.text(
+                egui::pos2(bar_x_start + 50.0, bar_y - 8.0),
+                egui::Align2::CENTER_BOTTOM,
+                format_scientific(math_width),
+                egui::FontId::monospace(12.0),
+                egui::Color32::WHITE,
+            );
+
+            // Screenshot Button (Top Right)
+            let capture_center = egui::pos2(rect.max.x - 30.0, rect.min.y + 30.0);
+            let capture_radius = 20.0;
+            let capture_rect = egui::Rect::from_center_size(capture_center, egui::vec2(capture_radius * 2.0, capture_radius * 2.0));
+            
+            let interact = ui.interact(capture_rect, ui.id().with("capture_btn"), egui::Sense::click());
+            
+            // Interaction colors (glow and press)
+            let mut bg_color = egui::Color32::from_black_alpha(150);
+            if self.capture_progress.is_some() {
+                // Dim out while rendering
+                bg_color = egui::Color32::from_black_alpha(200);
+            } else if interact.is_pointer_button_down_on() {
+                // Pressed flash
+                bg_color = egui::Color32::from_white_alpha(150);
+            } else if interact.hovered() {
+                // Hover glow
+                bg_color = egui::Color32::from_black_alpha(80);
+            }
+
+            // Draw button background and text
+            painter.circle_filled(capture_center, capture_radius, bg_color);
+            painter.text(
+                capture_center,
+                egui::Align2::CENTER_CENTER,
+                "📷",
+                egui::FontId::proportional(22.0),
+                if interact.is_pointer_button_down_on() { egui::Color32::BLACK } else { egui::Color32::WHITE },
+            );
+
+            // Draw active circular progress bar
+            if let Some(progress) = self.capture_progress {
+                // Let's manually draw a polyline arc
+                let mut points = Vec::new();
+                let num_segments = 32;
+                // -PI/2 is the "top" (12 o'clock)
+                let start_angle = -std::f32::consts::PI / 2.0;
+                let end_angle = start_angle + (progress * 2.0 * std::f32::consts::PI);
+                
+                for i in 0..=num_segments {
+                    let t = i as f32 / num_segments as f32;
+                    let angle = start_angle + (end_angle - start_angle) * t;
+                    let p = capture_center + egui::vec2(angle.cos() * capture_radius, angle.sin() * capture_radius);
+                    points.push(p);
+                }
+                
+                painter.add(egui::Shape::line(
+                    points,
+                    egui::Stroke::new(3.0, egui::Color32::GREEN),
+                ));
+            }
+
+            // Draw post-completion flash animation
+            if let Some(finish_time) = self.capture_finished_time {
+                let age = (current_time - finish_time) as f32;
+                if age < 1.0 {
+                    let alpha = (1.0 - age).clamp(0.0, 1.0);
+                    painter.circle_stroke(
+                        capture_center,
+                        capture_radius,
+                        egui::Stroke::new(3.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (255.0 * alpha) as u8)),
+                    );
+                }
+            }
+
+            if interact.clicked() && self.capture_progress.is_none() {
+                // Initialize progress to render UI instantly
+                self.capture_progress = Some(0.0);
+                let tx_prog = self.rx_progress.clone(); // Can't clone receiver directly, we need a sender copy
+                
+                // Oops, we need the sender handle specifically.
+                // We'll pass `self.rx_progress` into a structure or just pass the sender during initialization.
+                // Since `tx_progress` is dropped inside `default()`, we must refactor `MandelbrotApp` to store `tx_progress` 
+                // temporarily, or just create a new one every capture click!
+                            
+                let (tx_job_prog, rx_job_prog) = unbounded();
+                self.rx_progress = rx_job_prog; // Swap the active receiver for this job
+
+                // Calculate parameters for 4K capture
+                // 3840x2160, preserving the current view center and physical zoom ratio
+                let capture_w: u32 = 3840;
+                let capture_h: u32 = 2160;
+                
+                // Real width in math coords 
+                let math_w = rect.width() as f64 * pixels_to_coords;
+                // Ratio to convert 1080p width to 4k width math representation
+                let capture_pixels_to_coords = math_w / (capture_w as f64);
+
+                let cx = self.center_x;
+                let cy = self.center_y;
+
+                std::thread::spawn(move || {
+                    let mut img = image::RgbaImage::new(capture_w, capture_h);
+                    
+                    let x_min = cx - (capture_w as f64 * capture_pixels_to_coords * 0.5);
+                    let y_max = cy + (capture_h as f64 * capture_pixels_to_coords * 0.5);
+                    let dx = capture_pixels_to_coords;
+                    let dy = capture_pixels_to_coords;
+
+                    // Compute 4K
+                    let report_interval = capture_h / 100; // Report 1% increments
+                    for py in 0..capture_h {
+                        if py % report_interval == 0 {
+                            let _ = tx_job_prog.send(py as f32 / capture_h as f32);
+                        }
+                        
+                        for px in 0..capture_w {
+                            let mut r_sum = 0.0;
+                            let mut g_sum = 0.0;
+                            let mut b_sum = 0.0;
+
+                            // Include 2x2 MSAA on the 4K render itself for ultra high fidelity
+                            for sy in 0..2 {
+                                for sx in 0..2 {
+                                    let sub_x = px as f64 + (sx as f64 + 0.5) / 2.0;
+                                    let sub_y = py as f64 + (sy as f64 + 0.5) / 2.0;
+                                    
+                                    let cr = x_min + (sub_x * dx);
+                                    let ci = y_max - (sub_y * dy);
+                                    
+                                    let color = match mandelbrot(cr, ci) {
+                                        Some(val) => palette_color(val * 0.15),
+                                        None => [0, 0, 0, 255],
+                                    };
+                                    r_sum += color[0] as f64;
+                                    g_sum += color[1] as f64;
+                                    b_sum += color[2] as f64;
+                                }
+                            }
+
+                            img.put_pixel(px, py, image::Rgba([
+                                (r_sum / 4.0) as u8, 
+                                (g_sum / 4.0) as u8, 
+                                (b_sum / 4.0) as u8, 
+                                255
+                            ]));
+                        }
+                    }
+
+                    // Save to artifacts
+                    std::fs::create_dir_all("artifacts").unwrap_or_default();
+                    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+                    let path = format!("artifacts/capture_{}.png", timestamp);
+                    if let Err(e) = img.save(&path) {
+                        eprintln!("Failed to save screenshot: {}", e);
+                    } else {
+                        println!("Saved 4K screenshot to {}", path);
+                    }
+                    
+                    let _ = tx_job_prog.send(1.0); // 100% complete
+                });
+            }
         });
     }
 }
