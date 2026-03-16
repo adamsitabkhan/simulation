@@ -8,6 +8,7 @@ eframe = "0.27.2"
 egui = "0.27.2"
 crossbeam-channel = "0.5"
 image = "0.25.10"
+rand = "0.10.0"
 
 [profile.release]
 opt-level = 3
